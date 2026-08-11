@@ -968,21 +968,132 @@ func applyDecodeImpl(engine: ParakeetEngine, decoders: [TDTDecoder]) throws {
         "decode-impl \(impl): \(impl == "accel" ? "joint+predictor" : "joint") on Accelerate\n".utf8))
 }
 
-/// Decode one window `[startSample, endSample)`; if it blank-collapses (zero tokens on > 4 s
-/// of audio, see the collapse note in `transcribeFile`), halve and recurse. The 4 s floor
-/// bounds the recursion (28.8 → 14.4 → 7.2 → 3.6 s stops) and keeps genuine silence cheap:
-/// a short window with no tokens is silence, not a collapse. Word times are absolute.
+/// Windows at or below this never retry, whatever they decoded to. This term alone is what
+/// bounds the recursion — 28.8 → 14.4 → 7.2 → 3.6 s stops — so it must survive any retuning of
+/// the threshold below. It is not redundant with it: a blank run can rarely exceed its own
+/// window when a frame index lands in the encoder's bucket padding, and this is what stops
+/// that from recursing past the floor.
+let minRetryWindowSeconds = 4.0
+
+/// How long a token-free stretch inside one decoded window has to be before it is read as a
+/// blank collapse rather than as a pause.
+///
+/// Calibrated, not guessed. Over 10 h of narration (12 LibriVox readers, 105 040 words) the
+/// widest token-free stretch that was genuinely speech-free is **2.2 s** and 99.97 % are under
+/// 3 s, while every stretch past 4 s was a collapse sitting on top of real speech. 4 s is the
+/// bottom edge of the collapse population — 1.8× the widest real pause — and holding it there
+/// rather than higher matters, because the collapse walks blanks to the window edge from
+/// wherever it begins: its run length is arbitrary, so a threshold tucked just under the
+/// shortest collapse we happened to *observe* would sail straight past a shorter one.
+///
+/// Equal to `minRetryWindowSeconds` on purpose. That keeps the total-collapse case an exact
+/// superset of the original `tokens.isEmpty` guard, which fired on any empty window over 4 s —
+/// set this any higher and fully-collapsed 4–5 s windows silently stop being retried, and
+/// short final chunks carrying "End of chapter N" are exactly that shape.
+///
+/// Going *lower* was tried and measured: at 3.5 s the flag rate rises from 23 to 33 chunks per
+/// 11.5 h while recovering nothing extra, and the added marginal retries churn text without
+/// buying content (one traded a proper noun for a soundalike common word to gain one token). The
+/// acceptance rule below makes that cheap rather than harmful, but it is not free.
+let partialCollapseSeconds = 4.0
+
+/// Ceiling on how many words one window can plausibly hold, in words per second.
+///
+/// Calibrated like the thresholds above, not guessed: across 480 decoded Sherlock windows the
+/// fastest sustained narration reads 3.81 words/s (median 3.02). The model's *other* failure
+/// mode — the repetition loop, which in the mel-normalisation experiment ballooned one file by
+/// 2 800 words — emits near-continuously, far past any narrator. 6.0 sits ~1.6× above the
+/// fastest real window, so it cannot reject genuine speech, and a retry that lands above it is
+/// reading something no narrator said.
+let maxPlausibleWordsPerSecond = 6.0
+
+/// The longest stretch of a decoded window that produced no token, in seconds.
+///
+/// Counts the head (before the first token), every interior stretch, and the tail (after the
+/// last one). Frame indices are chunk-relative and one frame is 80 ms, so this is just their
+/// widest spacing, measured against the window's own edges.
+func longestBlankRun(frameIndices: [Int], windowSeconds: Double) -> Double {
+    guard let first = frameIndices.first, let last = frameIndices.last else { return windowSeconds }
+    let spf = WordTimestamps.secondsPerFrame
+    var longest = max(Double(first) * spf, windowSeconds - Double(last) * spf)
+    for (a, b) in zip(frameIndices, frameIndices.dropFirst()) {
+        longest = max(longest, Double(b - a) * spf)
+    }
+    return longest
+}
+
+/// The word-timestamp twin of `longestBlankRun(frameIndices:)`, for results that have crossed
+/// a seam join and no longer carry a single window's frame indices.
+///
+/// Only word *starts* are walked. A word's `end` is defined as the next word's start, so a
+/// collapse inflates the preceding word's end and never its start — the start is the one
+/// timestamp a collapse cannot fake (the same rule the framing-shift oracle uses).
+func longestBlankRun(words: [WordTimestamp], windowStart: Double, windowEnd: Double) -> Double {
+    guard let first = words.first, let last = words.last else { return windowEnd - windowStart }
+    var longest = max(first.start - windowStart, windowEnd - last.start)
+    for (a, b) in zip(words, words.dropFirst()) {
+        longest = max(longest, b.start - a.start)
+    }
+    return longest
+}
+
+/// Whether a retry actually repaired the collapse it was fired at, rather than merely reading
+/// more. Token count alone has a hole on each side: the repetition loop — the model's other
+/// failure mode — produces MORE tokens than the collapse it replaces, and a boundary word
+/// severed by the halving seam can decode as a fragment and push the count up by one without
+/// recovering anything (measured at threshold 3.5: a proper noun re-read as a soundalike, +1 word, no gap
+/// closed). Three tests, all required:
+///
+/// - **more tokens** — the original ratchet; churn that reads the same or less is discarded.
+/// - **the widest blank run shrank** by more than timestamp jitter. Re-framing re-times every
+///   word by a frame or two (80 ms each), so demand one full blank-with-duration-4 step
+///   (0.32 s): a retry that closed none of the gap it was fired at repaired nothing, whatever
+///   it did to the count.
+/// - **plausible density** — recovered words must stay under `maxPlausibleWordsPerSecond`;
+///   above it the "recovery" is a repetition loop, the one shape that beats the other two
+///   tests while making the transcript worse.
+func retryRepairs(originalTokens: Int, originalWords: [WordTimestamp],
+                  retryTokens: Int, retryWords: [WordTimestamp],
+                  windowStart: Double, windowEnd: Double) -> Bool {
+    let jitterFloor = 4 * WordTimestamps.secondsPerFrame
+    return retryTokens > originalTokens
+        && longestBlankRun(words: retryWords, windowStart: windowStart, windowEnd: windowEnd)
+            < longestBlankRun(words: originalWords, windowStart: windowStart, windowEnd: windowEnd)
+                - jitterFloor
+        && Double(retryWords.count) <= maxPlausibleWordsPerSecond * (windowEnd - windowStart)
+}
+
+/// Whether a decoded window shows a blank collapse — the TDT loop taking blanks across audio
+/// that should have produced tokens. See the collapse note in `transcribeFile`.
+///
+/// Two shapes, one test. A **total** collapse decodes the whole window to zero tokens. A
+/// **partial** collapse emits a normal prefix and then goes blank for the rest of the window,
+/// so `tokens` is non-empty and the original `tokens.isEmpty` guard never fired — that is the
+/// shape that silently swallowed six chapter announcements on the Sherlock corpus, up to 19 s
+/// of speech each. Measuring the widest token-free stretch catches both, because the total
+/// case is simply the stretch that spans the entire window.
+func isBlankCollapse(frameIndices: [Int], windowSeconds: Double) -> Bool {
+    // Measurement gate, deliberately kept: with the mitigation off, a run measures how often
+    // the decode collapses in the first place rather than how well the retry papers over it.
+    // The framing-shift drop oracle's retry-OFF arms depend on it.
+    if ProcessInfo.processInfo.environment["PARAKEET_NO_RETRY"] == "1" { return false }
+    return windowSeconds > minRetryWindowSeconds
+        && longestBlankRun(frameIndices: frameIndices, windowSeconds: windowSeconds) > partialCollapseSeconds
+}
+
+/// Decode one window `[startSample, endSample)`; if it blank-collapses, halve and recurse.
+/// Word times are absolute.
 func decodeWindowWithRetry(engine: ParakeetEngine, wav: PCM16WavFile,
                            startSample: Int, endSample: Int,
                            sr: Double) async throws -> (tokens: [Int], words: [WordTimestamp], subWindows: Int) {
     let r = try await engine.transcribe(samples: wav.samples(from: startSample, to: endSample))
     let start = Double(startSample) / sr, end = Double(endSample) / sr
-    if !r.tokens.isEmpty || endSample - startSample <= 4 * Int(sr) {
-        return (r.tokens,
+    let asIs = (r.tokens,
                 WordTimestamps.words(tokens: r.tokens, frameIndices: r.frameIndices,
                                      tokenizer: engine.tokenizer,
                                      chunkStart: start, chunkEnd: end), 1)
-    }
+    guard isBlankCollapse(frameIndices: r.frameIndices, windowSeconds: end - start) else { return asIs }
+
     let mid = startSample + (endSample - startSample) / 2
     let a = try await decodeWindowWithRetry(engine: engine, wav: wav,
                                             startSample: startSample, endSample: mid, sr: sr)
@@ -990,7 +1101,19 @@ func decodeWindowWithRetry(engine: ParakeetEngine, wav: PCM16WavFile,
                                             startSample: mid, endSample: endSample, sr: sr)
     let (tokens, words) = joinAcrossSeam(a: (a.tokens, a.words), b: (b.tokens, b.words),
                                          tokenizer: engine.tokenizer)
-    return (tokens, words, a.subWindows + b.subWindows)
+    // Halving changes the framing, which is the entire mechanism — but it is not guaranteed to
+    // be an improvement, and on a window that was merely quiet it returns the same text or
+    // less. Acceptance (`retryRepairs`) demands the retry read more, close the gap it was
+    // fired at, and stay under narration density — a ratchet against the un-retried decode
+    // that the severed-boundary-word fragment and the repetition loop cannot game.
+    //
+    // One honest limit survives: a retry that recovers speech while retokenizing the prefix
+    // more compactly can tie on count and be thrown away. That degrades to the un-retried
+    // decode, never below it.
+    return retryRepairs(originalTokens: r.tokens.count, originalWords: asIs.1,
+                        retryTokens: tokens.count, retryWords: words,
+                        windowStart: start, windowEnd: end)
+        ? (tokens, words, a.subWindows + b.subWindows) : asIs
 }
 
 /// Concatenate two decoded windows. The final text is `decode(tokensA + tokensB)`, which
@@ -1009,6 +1132,101 @@ func joinAcrossSeam(a: (tokens: [Int], words: [WordTimestamp]),
         words[words.count - 1].end = joined.end
     }
     return (a.tokens + b.tokens, words + bWords)
+}
+
+/// Second-line repair for a collapse the halving retry could not fix: re-decode the widest
+/// blank run under a *silence-shifted* framing and splice back only what lands inside the gap.
+///
+/// Mechanism, not a special case. The framing-shift oracle recovers exactly these spans by
+/// prepending silence to the whole file — the collapse is alignment-dependent, and a shifted
+/// grid re-rolls the alignment. This does the same per window, inside the encoder's fixed mel
+/// bucket: take the gap plus a little real context, prepend as much silence as the bucket has
+/// room for, decode once, and keep the whole words that start comfortably inside the gap. The
+/// residual population this targets is file-head boilerplate — windows whose head collapses at
+/// every halving level — but nothing here knows about chunk indexes: any window whose widest
+/// blank run survived the halving retry qualifies.
+///
+/// Single shot by design: the halving retry is the recursive tool, this is one extra framing.
+/// Returns nil when the bucket leaves no room to shift (a gap spanning nearly the whole
+/// window — halving already owns that shape) or when the re-decode read nothing in the gap.
+func silenceRerollRepair(engine: ParakeetEngine, wav: PCM16WavFile,
+                         r: ChunkResult, startSample: Int, endSample: Int,
+                         sr: Double) async throws -> (tokens: [Int], words: [WordTimestamp])? {
+    let spf = WordTimestamps.secondsPerFrame
+    let start = Double(startSample) / sr, end = Double(endSample) / sr
+    let windowSeconds = end - start
+
+    // Widest token-free stretch, window-relative, and where it sits in the token stream:
+    // tokens[..<splitIndex] were emitted before the gap, tokens[splitIndex...] after.
+    var gapLo = 0.0, gapHi = windowSeconds, splitIndex = 0
+    if !r.frameIndices.isEmpty {
+        let times = r.frameIndices.map { Double($0) * spf }
+        var widest = times[0]
+        gapHi = times[0]
+        for i in 1..<times.count where times[i] - times[i - 1] > widest {
+            widest = times[i] - times[i - 1]
+            gapLo = times[i - 1]; gapHi = times[i]; splitIndex = i
+        }
+        if windowSeconds - times[times.count - 1] > widest {
+            gapLo = times[times.count - 1]; gapHi = windowSeconds; splitIndex = r.tokens.count
+        }
+    }
+
+    // The span to re-decode: the gap plus a little real context each side to anchor it.
+    let lead = 1.0
+    let sLo = startSample + Int(max(0, gapLo - lead) * sr)
+    let sHi = startSample + min(Int((gapHi + lead) * sr), endSample - startSample)
+
+    // The mel bucket is fixed and the front end silently truncates past it, so the shift can
+    // only use the room the span leaves. 7 s where it fits — the offset the oracle validated —
+    // and no attempt below 1 s, which is inside the model's own pause tolerance.
+    let bucketSeconds = Double(engine.frontend.bucketSamples) / sr
+    let shift = min(7.0, bucketSeconds - Double(sHi - sLo) / sr)
+    guard shift >= 1.0 else { return nil }
+
+    let silence = [Float](repeating: 0, count: Int(shift * sr))
+    let r2 = try await engine.transcribe(samples: silence + wav.samples(from: sLo, to: sHi))
+
+    // Keep whole words that start comfortably inside the gap. The margin mirrors the oracle's:
+    // near a gap edge the two framings re-time the SAME word differently, and keeping it would
+    // duplicate the neighbour the original already has. A gap edge that is also the window
+    // edge has no neighbour to duplicate, so no margin there.
+    let margin = 0.6
+    let repairStart = Double(sLo) / sr - shift  // where the padded buffer's clock begins
+    let keepLo = start + gapLo + (splitIndex == 0 ? 0 : margin)
+    let keepHi = start + gapHi - (splitIndex == r.tokens.count ? 0 : margin)
+    var kept: [Int] = [], keptFrames: [Int] = []
+    var keeping = false
+    for (tok, f) in zip(r2.tokens, r2.frameIndices) {
+        if engine.tokenizer.startsWord(tok) {
+            let t = repairStart + Double(f) * spf
+            keeping = t >= keepLo && t <= keepHi
+        }
+        if keeping { kept.append(tok); keptFrames.append(f) }
+    }
+    guard !kept.isEmpty else { return nil }
+    let repairWords = WordTimestamps.words(tokens: kept, frameIndices: keptFrames,
+                                           tokenizer: engine.tokenizer,
+                                           chunkStart: repairStart, chunkEnd: Double(sHi) / sr)
+
+    // Splice: original-before + recovered + original-after, seams glued by the same rule the
+    // halving join uses. The before half's word list is rebuilt with the gap's true end as its
+    // clock edge, so the word whose duration had absorbed the gap stops claiming it.
+    let beforeTokens = Array(r.tokens[..<splitIndex])
+    let afterTokens = Array(r.tokens[splitIndex...])
+    let beforeWords = WordTimestamps.words(tokens: beforeTokens,
+                                           frameIndices: Array(r.frameIndices[..<splitIndex]),
+                                           tokenizer: engine.tokenizer,
+                                           chunkStart: start,
+                                           chunkEnd: repairWords.first?.start ?? (start + gapHi))
+    let afterWords = WordTimestamps.words(tokens: afterTokens,
+                                          frameIndices: Array(r.frameIndices[splitIndex...]),
+                                          tokenizer: engine.tokenizer,
+                                          chunkStart: start, chunkEnd: end)
+    return joinAcrossSeam(a: joinAcrossSeam(a: (beforeTokens, beforeWords),
+                                            b: (kept, repairWords),
+                                            tokenizer: engine.tokenizer),
+                          b: (afterTokens, afterWords), tokenizer: engine.tokenizer)
 }
 
 /// Wav → chunks → decode → segments with word times. This is the one transcription path both
@@ -1060,57 +1278,105 @@ func transcribeFile(engine: ParakeetEngine, path: String, label: String,
 
     // ---- blank-collapse retry -----------------------------------------------------------
     //
-    // The TDT loop can decode a whole ~28 s window to ZERO tokens: it takes a blank with
-    // duration 4 at every frame and walks off the end. This is a **model + fixed-bucket
-    // framing** failure, not a port bug; `bench/probe_collapse.py` showed it is
-    // window-bound (shifting or halving the window recovers the full text) and that the
-    // PyTorch oracle collapses on exactly the same windows; the validated Python driver
-    // ships the same mitigation (`coreai_run.py --collapse-retry`). Narrator/content
-    // dependent: LibriVox head/tail windows hit it, the audiobook corpus never does.
+    // The TDT loop can take a blank with duration 4 at every frame and walk across audio it
+    // should have transcribed. This is a **model + fixed-bucket framing** failure, not a port
+    // bug: it is window-bound (shifting or halving the window recovers the full text) and the
+    // PyTorch oracle collapses on exactly the same windows. Narrator/content dependent —
+    // LibriVox head and tail windows hit it, the audiobook corpus does not.
     //
-    // Mitigation, matching the Python driver: re-decode the collapsed chunk as two halves.
-    // Halving loses no audio and stays inside the chunk, so neighbouring chunks (and every
-    // chunk that decoded normally) are byte-untouched. Runs serially on the primary decoder
-    // after the parallel drain; cost is two extra chunk decodes per collapsed window only.
-    // Chunks ≤ 4 s are exempt (same threshold as Python): a short window with no tokens is
-    // far more likely to be genuine silence than a collapse.
+    // It has two shapes, and only one of them used to be caught. A **total** collapse decodes
+    // the window to zero tokens. A **partial** collapse decodes a normal prefix and then goes
+    // blank for the rest of the window: `tokens` is non-empty, so the old `tokens.isEmpty`
+    // guard never fired and the swallowed audio left no trace in the transcript — it was
+    // absorbed into the *duration* of the last surviving token. On the Sherlock corpus that
+    // silently cost six of twelve chapter-title announcements, 6–19 s of speech each, and the
+    // loss was only found by ear. `isBlankCollapse` measures the widest token-free stretch
+    // instead, which covers both shapes.
+    //
+    // Mitigation: re-decode the flagged chunk as two halves, each of which may recurse if it
+    // collapses too (measured: some LibriVox head windows collapse at BOTH the 28 s and the
+    // 14 s framing but decode fine at 7 s — the mel normalisation spans the padded window, so
+    // every window length is a different framing of the same audio). Halving loses no audio
+    // and stays inside the chunk, so neighbouring chunks are byte-untouched. Runs serially on
+    // the primary decoder after the parallel drain, and only a retry that actually reads more
+    // is kept. Cost is two extra decodes for a flagged window whose halves come back clean;
+    // if every level re-flags, a 28.8 s chunk bottoms out at 2 + 4 + 8 = 14 sub-decodes, so
+    // the true bound is ~3 window-lengths of extra compute on 1.3 % of chunks.
     var segments: [TranscribedSegment] = []
     var retried: [Int] = []
+    // Flagged-but-not-kept is the detector's false-positive rate, and it is worth seeing
+    // separately from the recoveries: it is the only thing the threshold trades away, and
+    // silently folding the two together is what let the partial collapse hide for so long.
+    var flagged = 0
     for (chunk, r) in results {
         let start = Double(chunk.start) / sr, end = Double(chunk.end) / sr
-        if r.tokens.isEmpty && (chunk.end - chunk.start) > 4 * wav.sampleRate {
-            // The chunk collapsed: re-decode it as two halves, each of which may recurse
-            // once more if it collapses too (measured: some LibriVox head windows collapse
-            // at BOTH the 28 s and the 14 s framing but decode fine at 7 s: the mel
-            // normalisation spans the padded window, so every window length is a different
-            // framing of the same audio).
+        var tokens = r.tokens
+        var words = WordTimestamps.words(tokens: r.tokens, frameIndices: r.frameIndices,
+                                         tokenizer: engine.tokenizer,
+                                         chunkStart: start, chunkEnd: end)
+        if isBlankCollapse(frameIndices: r.frameIndices, windowSeconds: end - start) {
+            flagged += 1
             let mid = chunk.start + (chunk.end - chunk.start) / 2
             let a = try await decodeWindowWithRetry(engine: engine, wav: wav,
                                                     startSample: chunk.start, endSample: mid, sr: sr)
             let b = try await decodeWindowWithRetry(engine: engine, wav: wav,
                                                     startSample: mid, endSample: chunk.end, sr: sr)
-            let (tokens, words) = joinAcrossSeam(a: (a.tokens, a.words), b: (b.tokens, b.words),
-                                                 tokenizer: engine.tokenizer)
-            segments.append(TranscribedSegment(start: start, end: end,
-                                               text: engine.text(tokens),
-                                               words: words, tokens: tokens))
-            retried.append(chunk.index)
-            let note = "\(label): chunk \(chunk.index) blank-collapse retry -> "
-                + "\(tokens.count) tokens in \(a.subWindows + b.subWindows) sub-windows\n"
-            FileHandle.standardError.write(Data(note.utf8))
-        } else {
-            segments.append(TranscribedSegment(
-                start: start, end: end,
-                text: engine.text(r.tokens),
-                words: WordTimestamps.words(tokens: r.tokens, frameIndices: r.frameIndices,
-                                            tokenizer: engine.tokenizer,
-                                            chunkStart: start, chunkEnd: end),
-                tokens: r.tokens))
+            let (retryTokens, retryWords) = joinAcrossSeam(a: (a.tokens, a.words),
+                                                          b: (b.tokens, b.words),
+                                                          tokenizer: engine.tokenizer)
+            if retryRepairs(originalTokens: tokens.count, originalWords: words,
+                            retryTokens: retryTokens.count, retryWords: retryWords,
+                            windowStart: start, windowEnd: end) {
+                let note = "\(label): chunk \(chunk.index) blank-collapse retry -> "
+                    + "\(retryTokens.count) tokens in \(a.subWindows + b.subWindows) sub-windows "
+                    + "(was \(tokens.count))\n"
+                FileHandle.standardError.write(Data(note.utf8))
+                tokens = retryTokens
+                words = retryWords
+                retried.append(chunk.index)
+            } else if retryTokens.count > tokens.count {
+                // Would have been kept under count-only acceptance; the guard rejected it.
+                // Logged separately so a corpus run can count how often the guard bites.
+                let note = "\(label): chunk \(chunk.index) blank-collapse retry rejected "
+                    + "(\(retryTokens.count) tokens vs \(tokens.count), gap not repaired)\n"
+                FileHandle.standardError.write(Data(note.utf8))
+            }
+            // Second line: if the kept result still carries a collapse-sized blank run — the
+            // halving retry recovered nothing, or not all of it — re-roll the gap once under a
+            // silence-shifted framing. Same acceptance bar as the halving retry.
+            if longestBlankRun(words: words, windowStart: start, windowEnd: end) > partialCollapseSeconds {
+                let repair = try await silenceRerollRepair(engine: engine, wav: wav, r: r,
+                                                           startSample: chunk.start,
+                                                           endSample: chunk.end, sr: sr)
+                if let repair,
+                   retryRepairs(originalTokens: tokens.count, originalWords: words,
+                                retryTokens: repair.tokens.count, retryWords: repair.words,
+                                windowStart: start, windowEnd: end) {
+                    let note = "\(label): chunk \(chunk.index) silence-reroll repair -> "
+                        + "\(repair.tokens.count) tokens (was \(tokens.count))\n"
+                    FileHandle.standardError.write(Data(note.utf8))
+                    tokens = repair.tokens
+                    words = repair.words
+                    if retried.last != chunk.index { retried.append(chunk.index) }
+                } else {
+                    // A residual gap the re-roll could not fill: either genuinely speech-free
+                    // (the common case — a long pause flagged in good faith) or a both-framings
+                    // collapse the oracle also cannot see. Logged so a corpus run can tell
+                    // repaired gaps from surrendered ones.
+                    let why = repair == nil ? "no recovery" : "rejected by acceptance"
+                    let note = "\(label): chunk \(chunk.index) silence-reroll \(why)\n"
+                    FileHandle.standardError.write(Data(note.utf8))
+                }
+            }
         }
+        segments.append(TranscribedSegment(start: start, end: end,
+                                           text: engine.text(tokens),
+                                           words: words, tokens: tokens))
     }
-    if !retried.isEmpty {
-        FileHandle.standardError.write(Data(
-            "\(label): blank-collapse retry on chunks \(retried)\n".utf8))
+    if flagged > 0 {
+        let summary = "\(label): blank-collapse \(flagged) chunk(s) flagged, "
+            + "\(retried.count) improved \(retried)\n"
+        FileHandle.standardError.write(Data(summary.utf8))
     }
     let transcript = segments.map(\.text)
         .filter { !$0.isEmpty }
