@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+__pycache__/
+reference/*.f32
+reference-all/
