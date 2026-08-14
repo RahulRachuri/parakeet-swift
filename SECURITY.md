@@ -1,9 +1,13 @@
 # Security
 
-This repository is a host. It distributes no weights and no bundles, and the conversion
-that produced the bundles lives elsewhere. The interesting question is therefore less "is
-there a bug in this code" and more "can you tell whether the bundles you loaded are the
-ones that were gated." This page answers that, including where the answer is no.
+This repository is a native Swift port of Parakeet-TDT: the mel front end, the greedy TDT
+decode loop, an Accelerate decode path that runs the predictor and joint outside the Core
+AI graphs, and the long-form handling around them. It distributes no weights and no
+bundles, and the conversion recipe that produces the bundles is published separately.
+
+So there are two questions worth asking, not one. Whether this code decodes correctly,
+and whether the artifacts it loaded are the ones that were gated. This page answers both,
+including where the answer is no.
 
 ## Reporting
 
@@ -36,18 +40,34 @@ signature you can verify offline.
 **A `.aimodel` bundle is data that a runtime executes.** Treat one from any source the way
 you would treat a binary dependency.
 
+**The flat weight blobs deserve separate attention.** The default decode path,
+`--decode-impl accel`, does not run the predictor and joint as graphs. It reads their
+weights as raw float32 arrays from the artifacts directory: `joint_head_w_f32.bin`,
+`pred_embed_f32.bin`, `pred_proj_{w,b}_f32.bin` and the LSTM gate blobs. These are the
+least self-describing artifacts in the set. They carry no shapes, no metadata and no
+provenance of their own beyond `pred_manifest.json` and `joint_head_manifest.json`
+alongside them, and the graph gates in `gates_v2.txt` do not cover them, because that path
+does not use the graphs. Swapping a blob is the cheapest way to change what this host
+outputs without touching a bundle. Run `--decode-impl coreai` to stay entirely on the
+three gated graphs, and compare the two paths if you want the blobs checked against
+something.
+
 ## Checking the bundles yourself
 
 The gate transcript is published beside the bundles as `gates_v2.txt`. It records what
 each graph was checked against and what it scored, including the end-to-end result of
 82/82 tokens exact against the Hugging Face `ParakeetForTDT` reference.
 
-The exporters and gates themselves live in the
+The exporters and gates that produce the bundles live in the
 [Core AI model zoo](https://github.com/john-rocky/coreai-model-zoo) under
 `conversion/parakeet/`, with the exact configuration recorded in
 `models/parakeet-v2/recipe.toml`. Re-running them reproduces the bundles and re-derives
-every number in the transcript. `tools/dump_reference.py` here dumps host-side reference
-tensors if you want to compare this Swift implementation against the Python one directly.
+every number in the transcript.
+
+Those gates check the bundles, not this host. To check the host itself,
+`tools/dump_reference.py` dumps reference tensors so this Swift implementation can be
+compared against the Python one stage by stage, which is the check that catches a decode
+bug rather than a tampered artifact.
 
 One gate is worth singling out, because it is the failure most likely to look fine. Mel
 padding is load-bearing: feeding per-clip mel with zero padding produces 85 tokens against
