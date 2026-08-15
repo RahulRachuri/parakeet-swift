@@ -459,11 +459,18 @@ The remaining speedups are runtime-side, so re-measuring on each new beta is wor
 This host, meaning everything under `Sources/` and `tools/`, is licensed under the Apache
 Licence, Version 2.0. See [LICENSE](LICENSE).
 
-The model is not. It is NVIDIA's
-[`parakeet-tdt-0.6b-v2`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), released
-under CC-BY-4.0, and any weights or converted bundles you run through this host stay under
-that licence and carry its attribution requirement. No weights are distributed in this
-repository.
+`Sources/ParakeetKit/VocabularyRescoring/` is adapted from
+[FluidAudio](https://github.com/FluidInference/FluidAudio) (Apache-2.0), which is also
+where the custom-vocabulary design comes from. See [NOTICE](NOTICE) for the upstream
+revision and the per-file details.
+
+The models are not covered by that licence. The transcription model is NVIDIA's
+[`parakeet-tdt-0.6b-v2`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) and the
+custom-vocabulary verifier is NVIDIA's
+[`parakeet-tdt_ctc-110m`](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m) CTC head.
+Both are released under CC-BY-4.0, and any weights or converted bundles you run through
+this host stay under that licence and carry its attribution requirement. No weights are
+distributed in this repository.
 
 The conversion route from NVIDIA's checkpoint to Core AI bundles follows the recipe
 published by [coreai-model-zoo](https://github.com/john-rocky/coreai-model-zoo) (BSD

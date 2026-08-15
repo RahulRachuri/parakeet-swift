@@ -1386,12 +1386,71 @@ func transcribeFile(engine: ParakeetEngine, path: String, label: String,
                                audioSeconds: Double(wav.frameCount) / sr)
 }
 
+/// The `--custom-vocab` flag set, or nil when no vocabulary was asked for.
+///
+/// Absent `--custom-vocab` this returns nil and `transcribe` never touches the
+/// rescoring module at all: the shipping path is not merely unchanged, it is
+/// not entered. That is the property the no-vocab equivalence check tests.
+func vocabularyOptions() throws -> VocabularyRescoringPass.Options? {
+    guard let vocabPath = option("custom-vocab") else { return nil }
+    guard let modelDir = option("ctc-model")
+        ?? ProcessInfo.processInfo.environment["PARAKEET_CTC_MODEL"]
+    else {
+        throw GraphError.message(
+            "--custom-vocab needs --ctc-model DIR (or PARAKEET_CTC_MODEL): the directory holding "
+                + "MelSpectrogram.mlmodelc, AudioEncoder.mlmodelc, vocab.json and tokenizer.json")
+    }
+    return VocabularyRescoringPass.Options(
+        vocabularyPath: vocabPath,
+        ctcModelDirectory: URL(fileURLWithPath: (modelDir as NSString).expandingTildeInPath),
+        minSimilarity: option("vocab-min-similarity").flatMap(Float.init),
+        cbw: option("vocab-cbw").flatMap(Float.init),
+        marginSeconds: option("vocab-margin").flatMap(Double.init),
+        shortTermTaperPivot: option("vocab-short-term-taper-pivot").flatMap(Int.init),
+        spotterMinSimilarity: option("vocab-spotter-min-sim").flatMap(Float.init),
+        spotterMinSimilarityMultiWord: option("vocab-spotter-min-sim-multi").flatMap(Float.init),
+        disableSpotterRescue: flag("vocab-disable-spotter-rescue")
+    )
+}
+
+/// Run the vocabulary post-pass over a finished transcription and return the
+/// corrected transcript.
+///
+/// The words are flattened across segments first: the verifier sees the file as
+/// one continuous frame timeline, so the rescorer has to as well, and a term
+/// spanning a chunk seam would otherwise be invisible to it.
+func applyVocabularyRescoring(_ options: VocabularyRescoringPass.Options,
+                              to out: TranscriptionOutput,
+                              wavPath: String) async throws -> String {
+    let wav = try PCM16WavFile(url: URL(fileURLWithPath: wavPath))
+    let t0 = Date()
+    let pass = try await VocabularyRescoringPass.load(options: options)
+    let loadSeconds = -t0.timeIntervalSinceNow
+
+    let words = out.segments.flatMap(\.words)
+    let outcome = try await pass.run(words: words, sampleCount: wav.frameCount) { lo, hi in
+        wav.samples(from: lo, to: hi)
+    }
+
+    FileHandle.standardError.write(Data(String(
+        format: "vocab: %d terms, %d CTC frames; load %.2f s, ctc %.2f s, rescore %.2f s; "
+            + "%d replacement(s)\n",
+        outcome.termCount, outcome.frameCount, loadSeconds, outcome.ctcSeconds,
+        outcome.rescoreSeconds, outcome.replacements.count).utf8))
+    for (original, replacement) in outcome.replacements.prefix(200) {
+        FileHandle.standardError.write(Data("vocab:   '\(original)' -> '\(replacement)'\n".utf8))
+    }
+
+    return outcome.text
+}
+
 /// `transcribe <wav> [--json PATH]`: plain transcript on stdout, progress on stderr,
 /// and (with `--json`) the segments/words JSON written to PATH.
 func cmdTranscribe() async throws {
     guard argv.count >= 2, !argv[1].hasPrefix("--") else {
         throw GraphError.message("usage: transcribe <audio_16k_mono.wav> [--json PATH]")
     }
+    let vocab = try vocabularyOptions()
     let engine = try await ParakeetEngine(paths: artifactPaths(), plan: parsePlan(option("plan")))
     let shape = try await DecodeShape.fromFlags(engine: engine)
     let out = try await transcribeFile(engine: engine, path: argv[1], label: "transcribe",
@@ -1402,7 +1461,15 @@ func cmdTranscribe() async throws {
         try data.write(to: URL(fileURLWithPath: jsonPath))
         FileHandle.standardError.write(Data("wrote \(jsonPath)\n".utf8))
     }
-    print(out.transcript)
+    // The JSON above is deliberately the *decode's* output, times included: the
+    // rescorer rewrites words, not timings, so publishing rescored text against
+    // unrescored word times would be a lie about alignment. Only stdout carries
+    // the corrected transcript.
+    if let vocab {
+        print(try await applyVocabularyRescoring(vocab, to: out, wavPath: argv[1]))
+    } else {
+        print(out.transcript)
+    }
 }
 
 /// `serve` starts a long-running JSON-lines worker: one request per stdin line
@@ -1499,6 +1566,28 @@ do {
                   transcript on stdout, and with --json a
                   {"text","segments":[{start,end,text,words:[{word,start,end}]}]} file with
                   absolute times in seconds (words on the 80 ms encoder-frame grid).
+          transcribe --custom-vocab <file> --ctc-model <dir> [vocab options]
+                  correct proper nouns against a term list, as a post-pass over the finished
+                  transcript. <file> is a JSON config or one term per line (auto-detected by
+                  the first byte); <dir> holds the parakeet-ctc-110m Core ML bundles plus
+                  vocab.json and tokenizer.json (or set PARAKEET_CTC_MODEL). A second CTC
+                  model scores each candidate term AND the word already transcribed over the
+                  same frames, and replaces only when the term wins; without --custom-vocab
+                  none of this runs and the transcript is byte-identical to before.
+                  --vocab-min-similarity <0-1>  string-similarity gate (default: size-aware,
+                                                0.50 for <=10 terms, 0.55 for 11-100, 0.60 above)
+                  --vocab-cbw <float>           context-biasing boost added to the term's
+                                                CTC score (default 4.5)
+                  --vocab-margin <sec>          frame-alignment slack per word (default 0.10)
+                  --vocab-disable-spotter-rescue
+                                                turn off the acoustic rescue pass; the biggest
+                                                precision win on short vocabularies
+                  --vocab-short-term-taper-pivot <n>   shrink the boost for terms under n tokens
+                  --vocab-spotter-min-sim <0-1>        similarity floor for single-word rescues
+                  --vocab-spotter-min-sim-multi <0-1>  same floor for multi-word rescues
+                  The JSON form additionally takes a per-term "minSimilarity", which is the
+                  only way to split two terms sitting at the same edit distance from their
+                  respective false and true positives.
           serve   [--plan ...] [--stream-depth D] [--decode-workers N]
                   [--decode-qos default|utility|background]
                   JSON-lines worker: one {"audio":"/path.wav"} request per stdin line, one

@@ -1,0 +1,95 @@
+parakeet-swift
+Copyright 2026 the parakeet-swift authors
+
+This product includes software developed at FluidInference
+(https://github.com/FluidInference/FluidAudio).
+
+--------------------------------------------------------------------------------
+FluidAudio — Apache License 2.0
+--------------------------------------------------------------------------------
+
+Everything under `Sources/ParakeetKit/VocabularyRescoring/` is adapted from
+FluidAudio, upstream commit 667181a, and remains under the Apache License,
+Version 2.0. A copy of that licence is in LICENSE, which is the same licence
+this host uses.
+
+Adapted files and their upstream sources, all under
+`Sources/FluidAudio/ASR/Parakeet/SlidingWindow/CustomVocabulary/` unless noted:
+
+  ContextBiasingConstants.swift
+      ContextBiasingConstants.swift
+
+  CustomVocabulary.swift
+      CustomVocabularyContext.swift
+
+  CtcTokenizer.swift
+      WordSpotting/BpeTokenizer.swift
+      WordSpotting/CtcTokenizer.swift
+
+  CtcModels.swift
+      WordSpotting/CtcModels.swift
+
+  CtcKeywordSpotter.swift
+      WordSpotting/CtcKeywordSpotter.swift
+      WordSpotting/CtcKeywordSpotter+Inference.swift
+
+  CtcDPAlgorithm.swift
+      WordSpotting/CtcDPAlgorithm.swift
+
+  BKTree.swift
+      BKTree/BKTree.swift
+      ../../../../Shared/StringUtils.swift  (levenshteinDistance)
+
+  VocabularyRescorer.swift
+      Rescorer/VocabularyRescorer.swift
+
+  VocabularyRescorer+Utilities.swift
+      Rescorer/VocabularyRescorer+Utilities.swift
+
+  VocabularyRescorer+CandidateMatching.swift
+      BKTree/VocabularyRescorer+CandidateMatching.swift
+
+  VocabularyRescorer+TokenEvaluation.swift
+      Rescorer/VocabularyRescorer+TokenEvaluation.swift
+
+  VocabularyRescorer+TokenRescoring.swift
+      Rescorer/VocabularyRescorer+TokenRescoring.swift
+
+`VocabularyRescoringPass.swift` is original to this repository: it is the
+adapter that feeds this host's decode output into the ported rescorer.
+
+Each adapted file carries an Apache-2.0 header naming its upstream source and
+summarising how it diverges. The substantive divergences, in one place:
+
+  * The diagnostic candidate-evidence API is not ported. It is opt-in upstream
+    and inert when the caller does not request it, so its absence cannot move a
+    replacement decision.
+  * Model downloading is not ported. Model directories are always passed in.
+  * Word timings are built from this package's own decode output rather than
+    from upstream's `TokenTiming`, applying the same one-encoder-frame
+    emission-delay correction.
+  * A `minSimilarity` written in a JSON vocabulary config is honoured as a
+    fallback below the command-line flag. Upstream's batch CLI reads only the
+    flag and the size-aware default.
+  * Hot paths were rewritten without changing their values: `MLMultiArray`
+    element access uses typed buffers instead of `NSNumber` boxing, BPE merge
+    ranks are a dictionary rather than a linear array scan, and the Levenshtein
+    table keeps two rolling rows instead of the full matrix.
+
+--------------------------------------------------------------------------------
+Models
+--------------------------------------------------------------------------------
+
+No model weights are distributed in this repository. The models this host runs
+are NVIDIA's, released under CC-BY-4.0, and any weights or converted bundles
+carry that licence and its attribution requirement:
+
+  * Transcription: nvidia/parakeet-tdt-0.6b-v2
+    https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2
+
+  * Custom-vocabulary verifier (CTC head): nvidia/parakeet-tdt_ctc-110m
+    https://huggingface.co/nvidia/parakeet-tdt_ctc-110m
+
+The conversion recipe from NVIDIA's checkpoints to Core AI bundles follows
+coreai-model-zoo (BSD 3-Clause, (c) 2026 Daisuke Majima). No source from it is
+vendored here.
