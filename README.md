@@ -9,6 +9,11 @@ On an M4 Pro it transcribes a 66.5 minute audiobook chapter in about 14 seconds 
 clock, model load included, which is roughly 280 times faster than real time. Word error
 rate on LibriSpeech is 1.97 percent on test-clean and 4.29 percent on test-other.
 
+How it got that fast is its own story: ten optimization rounds from a 41x baseline to
+291x peak, a Neural Engine that lost to the GPU, and a bug that produced 406,000 garbage
+tokens while every API reported success. It is written up in
+[A 10-hour audiobook, transcribed on an iPhone in 5 minutes](https://rachuri.me/blog/parakeet-apple-silicon/).
+
 ## What the names mean
 
 The vocabulary here is borrowed from four different places, so it is worth pinning down
