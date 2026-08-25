@@ -180,11 +180,10 @@ and logging each retry to stderr.
 bundles — no checkout, no `PARAKEET_ARTIFACTS`, no manual download.
 
 ```swift
-.package(url: "https://github.com/RahulRachuri/parakeet-swift", branch: "main")
+.package(url: "https://github.com/RahulRachuri/parakeet-swift", from: "0.2.0")
 // target dependency: .product(name: "ParakeetKit", package: "parakeet-swift")
 ```
 
-Track `main`: `v0.1.0` predates this entry point.
 
 ```swift
 import ParakeetKit
