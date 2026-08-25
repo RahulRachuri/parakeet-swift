@@ -13,6 +13,13 @@ import PackageDescription
 let package = Package(
     name: "parakeet-swift",
     platforms: [.macOS("27.0")],
+    // `ParakeetKit` is exported so an app can depend on this package directly and resolve
+    // its own bundles through `ParakeetEngine.fromHub()`, rather than building the CLI and
+    // pointing `PARAKEET_ARTIFACTS` at a directory it downloaded by hand.
+    products: [
+        .library(name: "ParakeetKit", targets: ["ParakeetKit"]),
+        .executable(name: "parakeet-swift", targets: ["parakeet-swift"]),
+    ],
     targets: [
         .target(
             name: "ParakeetKit",
