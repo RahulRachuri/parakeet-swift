@@ -180,9 +180,16 @@ and logging each retry to stderr.
 bundles — no checkout, no `PARAKEET_ARTIFACTS`, no manual download.
 
 ```swift
-.package(url: "https://github.com/RahulRachuri/parakeet-swift", from: "0.2.0")
+.package(url: "https://github.com/RahulRachuri/parakeet-swift", branch: "main")
 // target dependency: .product(name: "ParakeetKit", package: "parakeet-swift")
 ```
+
+A branch dependency, not `from: "0.2.0"`, and that is a limitation rather than a
+preference. `ParakeetKit` passes `-DACCELERATE_NEW_LAPACK` and `-DACCELERATE_LAPACK_ILP64`
+to the clang importer through `unsafeFlags`, and SwiftPM refuses a package carrying those
+when it is resolved by version. Branch and path dependencies are exempt, so this resolves;
+`from:` fails with *the target 'ParakeetKit' contains unsafe build flags*. The tag exists
+and marks the release, but it cannot be consumed as a version until those flags go.
 
 
 ```swift
