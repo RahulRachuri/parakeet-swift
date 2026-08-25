@@ -13,6 +13,11 @@
 //
 // No third-party dependencies: URLSession for transport, CryptoKit for the digest.
 //
+// This file is duplicated in pocket-tts-swift rather than shared. Neither host depends on
+// the other and each pins its own repositories, so a package for ~300 lines would
+// couple two ports that have no other reason to move together. If a third port
+// appears, that trade changes — keep the two copies in step until then.
+//
 
 import Foundation
 import CryptoKit

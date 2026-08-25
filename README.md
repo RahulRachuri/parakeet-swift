@@ -77,7 +77,10 @@ There is nothing to resolve and no other build step. The binary lands at
 NVIDIA publishes the checkpoint and Apple's `coreai-build` toolchain compiles it into
 `.aimodel` bundles. The conversion route this host expects is the recipe published by
 [coreai-model-zoo](https://github.com/john-rocky/coreai-model-zoo); run that, then point
-`PARAKEET_ARTIFACTS` at the directory it produces.
+`PARAKEET_ARTIFACTS` at the directory it produces. Converted bundles are also published at
+[rahulrachuri/parakeet-tdt-0.6b-v2-coreai](https://huggingface.co/rahulrachuri/parakeet-tdt-0.6b-v2-coreai);
+an app can skip this step entirely and let the package fetch them, see
+[Use as a package](#use-as-a-package).
 
 The host resolves filenames inside that directory, so the layout has to match:
 
@@ -170,6 +173,42 @@ fixed framing rather than a fault in this host, since the PyTorch model collapse
 same windows. `transcribe` and `serve` mitigate it by re-decoding a zero-token window as
 two halves, recursing while the halves keep collapsing and stay longer than 4 seconds,
 and logging each retry to stderr.
+
+## Use as a package
+
+`ParakeetKit` is a library product, so an app can depend on it and let it resolve its own
+bundles — no checkout, no `PARAKEET_ARTIFACTS`, no manual download.
+
+```swift
+.package(url: "https://github.com/RahulRachuri/parakeet-swift", branch: "main")
+// target dependency: .product(name: "ParakeetKit", package: "parakeet-swift")
+```
+
+Track `main`: `v0.1.0` predates this entry point.
+
+```swift
+import ParakeetKit
+
+let engine = try await ParakeetEngine.fromHub()
+let result = try await engine.transcribe(samples: samples)   // 16 kHz mono float
+let text = try ParakeetTokenizer(tokenizerJSON: engine.paths.tokenizer).decode(result.tokens)
+```
+
+`fromHub` resolves [the bundle repository](https://huggingface.co/rahulrachuri/parakeet-tdt-0.6b-v2-coreai)
+at a pinned, immutable revision, so a later push cannot change what a pinned consumer
+receives. It is about 1.27 GB, nearly all of it the fp16 encoder, fetched once into
+`~/Library/Caches/parakeet-swift/hub/` and reused; a warm start pays a cache check
+rather than the download. Files published for provenance rather than loading — the conversion patch, the
+gate transcript, the card — are evidence for a reader, not inputs to a run, and are
+skipped.
+
+Every LFS-stored payload is checked against the SHA-256 the Hub reports and moved into
+place only once verified, so an interrupted download cannot be mistaken for a complete one.
+
+Pass `progress:` for a closure to drive a loading UI — it is `@Sendable` and called from
+URLSession's queue, so hop to the main actor before touching UI. `cacheDirectory:` puts the
+cache elsewhere. The Accelerate decode path is unaffected and still opt-in; it reads its
+blobs from the same directory, reachable as `engine.paths.joint.deletingLastPathComponent()`.
 
 ## Commands
 
@@ -433,6 +472,9 @@ Sources/ParakeetKit/
                                        Slaney mel, log, per-bin unbiased normalisation
   Tokenizer.swift                      Metaspace/BPE decode straight off tokenizer.json
   ParakeetEngine.swift                 artifact paths, compute plan, the TDT greedy loop
+  HubStore.swift                       pinned-revision Hub resolution: list, fetch,
+                                       digest-check against the Hub's SHA-256, cache
+  ParakeetEngine+Hub.swift             ParakeetEngine.fromHub(), the package entry point
   AccelJoint.swift, AccelPredictor.swift  the graph-free decode hot path (SGEMV/vDSP/vForce)
   Chunker.swift                        the audio cut policy
   AudioInput.swift                     chunks.json manifest reader, mmap'd PCM16 wav reader
