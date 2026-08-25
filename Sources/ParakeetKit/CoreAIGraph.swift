@@ -169,8 +169,11 @@ func zeroFloats(_ nd: inout NDArray, count: Int) {
 /// memcpy between two float32 NDArrays the runtime owns (no Swift array hop).
 func copyFloats(from src: inout NDArray, to dst: inout NDArray, count: Int) {
     var sv = src.mutableView(as: Float.self)
-    var dv = dst.mutableView(as: Float.self)
     sv.withUnsafeMutablePointer { sp, _, _ in
+        // The destination view is taken *inside*, not captured: `withUnsafeMutablePointer`
+        // consumes the view, and Swift 6.4 rejects consuming a closure capture it cannot
+        // prove runs once. Same single memcpy, same two buffers.
+        var dv = dst.mutableView(as: Float.self)
         dv.withUnsafeMutablePointer { dp, _, _ in dp.update(from: sp, count: count) }
     }
 }

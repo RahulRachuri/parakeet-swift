@@ -223,8 +223,8 @@ public final class TDTDecoder: @unchecked Sendable {
                 result.jointCalls += 1
             } else {
                 // enc_proj[frame:frame+1] straight into the runtime's buffer (no Swift array hop).
-                var encView = encIn.mutableView(as: Float.self)
                 enc.withUnsafeBufferPointer { src in
+                    var encView = encIn.mutableView(as: Float.self)
                     encView.withUnsafeMutablePointer { dst, _, _ in
                         dst.update(from: src.baseAddress! + frame * H, count: H)
                     }
