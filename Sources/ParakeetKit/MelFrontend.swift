@@ -1,4 +1,5 @@
 import Accelerate
+import CParakeetBLAS
 import Foundation
 
 /// Log-mel front-end for Parakeet's fixed 30 s encoder bucket.
@@ -161,21 +162,18 @@ public struct MelFrontend: Sendable {
 
     /// C[m×n] = A[m×k] · B[k×n], all row-major float32.
     ///
-    /// The `numericCast`es are not decoration. CBLAS's index type is `Int` when Accelerate's
-    /// ILP64 headers are selected (`ACCELERATE_LAPACK_ILP64`, which the macOS package sets) and
-    /// `Int32` otherwise, and the iOS SDK ships only the 32-bit-index declaration. `numericCast`
-    /// is a generic `BinaryInteger -> BinaryInteger` conversion whose *result* type is inferred
-    /// from the parameter it is being passed to, so one spelling compiles against both headers.
-    /// (A C++ reader can read it as a `static_cast` whose target type the compiler picks.)
+    /// Through `CParakeetBLAS` rather than calling CBLAS here. The index width differs
+    /// between Accelerate's current headers and the iOS SDK's, and doing that narrowing in C
+    /// keeps one spelling at the call site; the defines that select the current headers have
+    /// to live on a C target anyway, for reasons its own header explains.
     private func matmul(_ a: [Float], _ b: [Float], into c: inout [Float], m: Int, k: Int, n: Int) {
         a.withUnsafeBufferPointer { pa in
             b.withUnsafeBufferPointer { pb in
                 c.withUnsafeMutableBufferPointer { pc in
-                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                                numericCast(m), numericCast(n), numericCast(k),
-                                1.0, pa.baseAddress!, numericCast(k),
-                                pb.baseAddress!, numericCast(n),
-                                0.0, pc.baseAddress!, numericCast(n))
+                    pk_sgemm_row_major(m, n, k,
+                                       pa.baseAddress!, k,
+                                       pb.baseAddress!, n,
+                                       pc.baseAddress!, n)
                 }
             }
         }

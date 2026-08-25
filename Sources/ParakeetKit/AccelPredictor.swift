@@ -1,4 +1,5 @@
 import Accelerate
+import CParakeetBLAS
 import Foundation
 
 /// The predictor (embedding → 2× LSTM cell → projector) as plain Accelerate arithmetic:
@@ -85,19 +86,14 @@ public final class AccelPredictor: Sendable {
                                 bSum[l].withUnsafeBufferPointer {
                                     g.baseAddress!.update(from: $0.baseAddress!, count: 4 * H)
                                 }
-                                // numericCast on CBLAS indices: Int on macOS (ILP64),
-                                // Int32 on the iOS SDK (see MelFrontend.matmul).
+                                // g already holds b_ih + b_hh, and the wrapper accumulates.
                                 wIH[l].withUnsafeBufferPointer {
-                                    cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                                                numericCast(4 * H), numericCast(H), 1.0,
-                                                $0.baseAddress!, numericCast(H),
-                                                x, 1, 1.0, g.baseAddress!, 1)
+                                    pk_sgemv_row_major_accumulate(4 * H, H, $0.baseAddress!, H,
+                                                                  x, g.baseAddress!)
                                 }
                                 wHH[l].withUnsafeBufferPointer {
-                                    cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                                                numericCast(4 * H), numericCast(H), 1.0,
-                                                $0.baseAddress!, numericCast(H),
-                                                hl, 1, 1.0, g.baseAddress!, 1)
+                                    pk_sgemv_row_major_accumulate(4 * H, H, $0.baseAddress!, H,
+                                                                  hl, g.baseAddress!)
                                 }
                                 let i = g.baseAddress!, f = i + H, gg = f + H, o = gg + H
                                 sigmoidInPlace(i, H); sigmoidInPlace(f, H); sigmoidInPlace(o, H)
@@ -115,10 +111,8 @@ public final class AccelPredictor: Sendable {
                                     d.baseAddress!.update(from: $0.baseAddress!, count: H)
                                 }
                                 projW.withUnsafeBufferPointer {
-                                    cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                                                numericCast(H), numericCast(H), 1.0,
-                                                $0.baseAddress!, numericCast(H),
-                                                x, 1, 1.0, d.baseAddress!, 1)
+                                    pk_sgemv_row_major_accumulate(H, H, $0.baseAddress!, H,
+                                                                  x, d.baseAddress!)
                                 }
                             }
                         }

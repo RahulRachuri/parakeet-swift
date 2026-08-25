@@ -1,4 +1,5 @@
 import Accelerate
+import CParakeetBLAS
 import Foundation
 
 /// The joint head as plain Accelerate arithmetic: the dispatch-elimination spike.
@@ -51,11 +52,9 @@ public final class AccelJoint: Sendable {
                     out.baseAddress!.update(from: bp.baseAddress!, count: r)
                 }
                 w.withUnsafeBufferPointer { wp in
-                    // numericCast: CBLAS indices are Int on macOS (ILP64) but Int32 on the
-                    // iOS SDK: one spelling for both headers (see MelFrontend.matmul).
-                    cblas_sgemv(CblasRowMajor, CblasNoTrans, numericCast(r), numericCast(h),
-                                1.0, wp.baseAddress!, numericCast(h),
-                                t.baseAddress!, 1, 1.0, out.baseAddress!, 1)
+                    // out already holds b, and the wrapper accumulates: out += W·t.
+                    pk_sgemv_row_major_accumulate(r, h, wp.baseAddress!, h,
+                                                  t.baseAddress!, out.baseAddress!)
                 }
             }
         }

@@ -21,13 +21,23 @@ let package = Package(
         .executable(name: "parakeet-swift", targets: ["parakeet-swift"]),
     ],
     targets: [
+        // Accelerate's current CBLAS interface is selected by two preprocessor defines, and
+        // they have to reach the headers as they are parsed. Passed as raw compiler flags
+        // they land in SwiftPM's `unsafeFlags`, and a package carrying those cannot be
+        // depended on by version -- only by branch or path. Declared as `.define` on a C
+        // target they are a setting SwiftPM recognises, and the restriction does not apply.
+        // That is the whole reason this target exists; see its header.
+        .target(
+            name: "CParakeetBLAS",
+            cSettings: [
+                .define("ACCELERATE_NEW_LAPACK", to: "1"),
+                .define("ACCELERATE_LAPACK_ILP64", to: "1"),
+            ],
+            linkerSettings: [.linkedFramework("Accelerate")]
+        ),
         .target(
             name: "ParakeetKit",
-            swiftSettings: [
-                // Opt into Accelerate's current (ILP64-capable) CBLAS headers; without this
-                // `cblas_sgemm` is flagged deprecated.
-                .unsafeFlags(["-Xcc", "-DACCELERATE_NEW_LAPACK=1", "-Xcc", "-DACCELERATE_LAPACK_ILP64=1"])
-            ],
+            dependencies: ["CParakeetBLAS"],
             linkerSettings: [.linkedFramework("CoreAI")]
         ),
         .executableTarget(

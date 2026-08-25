@@ -180,16 +180,9 @@ and logging each retry to stderr.
 bundles — no checkout, no `PARAKEET_ARTIFACTS`, no manual download.
 
 ```swift
-.package(url: "https://github.com/RahulRachuri/parakeet-swift", branch: "main")
+.package(url: "https://github.com/RahulRachuri/parakeet-swift", from: "0.3.0")
 // target dependency: .product(name: "ParakeetKit", package: "parakeet-swift")
 ```
-
-A branch dependency, not `from: "0.2.0"`, and that is a limitation rather than a
-preference. `ParakeetKit` passes `-DACCELERATE_NEW_LAPACK` and `-DACCELERATE_LAPACK_ILP64`
-to the clang importer through `unsafeFlags`, and SwiftPM refuses a package carrying those
-when it is resolved by version. Branch and path dependencies are exempt, so this resolves;
-`from:` fails with *the target 'ParakeetKit' contains unsafe build flags*. The tag exists
-and marks the release, but it cannot be consumed as a version until those flags go.
 
 
 ```swift
@@ -482,6 +475,10 @@ Sources/ParakeetKit/
                                        digest-check against the Hub's SHA-256, cache
   ParakeetEngine+Hub.swift             ParakeetEngine.fromHub(), the package entry point
   AccelJoint.swift, AccelPredictor.swift  the graph-free decode hot path (SGEMV/vDSP/vForce)
+Sources/CParakeetBLAS/                 the two CBLAS calls behind plain C, so Accelerate's
+                                       current-header defines sit on a C target where
+                                       SwiftPM recognises them and the package stays
+                                       resolvable by version
   Chunker.swift                        the audio cut policy
   AudioInput.swift                     chunks.json manifest reader, mmap'd PCM16 wav reader
   BinaryIO.swift                       flat float32 I/O and the cosine/LCS gate metrics
