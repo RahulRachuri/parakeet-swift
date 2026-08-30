@@ -201,7 +201,7 @@ and logging each retry to stderr.
 bundles — no checkout, no `PARAKEET_ARTIFACTS`, no manual download.
 
 ```swift
-.package(url: "https://github.com/RahulRachuri/parakeet-swift", from: "0.3.0")
+.package(url: "https://github.com/RahulRachuri/parakeet-swift", from: "0.4.0")
 // target dependency: .product(name: "ParakeetKit", package: "parakeet-swift")
 ```
 
