@@ -1238,8 +1238,21 @@ func silenceRerollRepair(engine: ParakeetEngine, wav: PCM16WavFile,
 /// below sees chunk 0, 1, 2, … regardless of worker scheduling, and each result arrives with
 /// its own chunk's sample offsets; words are stamped against their own chunk's absolute
 /// times, never a neighbour's. The precondition pins both properties.
+/// `onProgress` reports retired work as `(done, total)`. A long file is a single
+/// call that can run for minutes with nothing on stdout, so a caller driving a UI
+/// (or a pipeline that has to distinguish "slow" from "wedged") has no other way
+/// to tell that anything is happening.
+///
+/// `total` is **twice** the chunk count, because a file is walked twice: once to
+/// decode the chunks, and once to assemble words and re-decode the few windows
+/// the blank-collapse detector flags. Counting only the decode would report 100%
+/// with the second pass still to run, which is the one number a progress
+/// reading must never show early. The two passes are not equally fast — decode
+/// dominates — so the second half of the range moves quicker than the first;
+/// that is the true shape of the work rather than an artefact.
 func transcribeFile(engine: ParakeetEngine, path: String, label: String,
-                    shape: DecodeShape) async throws -> TranscriptionOutput {
+                    shape: DecodeShape,
+                    onProgress: ((Int, Int) -> Void)? = nil) async throws -> TranscriptionOutput {
     let wav = try PCM16WavFile(url: URL(fileURLWithPath: path))
     guard wav.sampleRate == 16000 else {
         throw GraphError.message("\(path): expected 16 kHz mono PCM16 (got \(wav.sampleRate) Hz); resample first")
@@ -1261,6 +1274,8 @@ func transcribeFile(engine: ParakeetEngine, path: String, label: String,
         shape.decodeQoSLabel).utf8))
 
     var results: [(chunk: ChunkManifest.Chunk, r: ChunkResult)] = []
+    let progressTotal = chunks.count * 2
+    var progressDone = 0
     try await runPipelined(engine: engine,
                            chunks: chunks,
                            samples: { wav.samples(from: $0.start, to: $0.end) },
@@ -1271,6 +1286,8 @@ func transcribeFile(engine: ParakeetEngine, path: String, label: String,
                            decoders: shape.decoders,
                            decodeQoS: shape.decodeQoS) { chunk, r in
         results.append((chunk, r))
+        progressDone += 1
+        onProgress?(progressDone, progressTotal)
     }
     precondition(results.count == chunks.count &&
                  zip(results, chunks).allSatisfy { $0.chunk.index == $1.index },
@@ -1309,6 +1326,10 @@ func transcribeFile(engine: ParakeetEngine, path: String, label: String,
     // silently folding the two together is what let the partial collapse hide for so long.
     var flagged = 0
     for (chunk, r) in results {
+        defer {
+            progressDone += 1
+            onProgress?(progressDone, progressTotal)
+        }
         let start = Double(chunk.start) / sr, end = Double(chunk.end) / sr
         var tokens = r.tokens
         var words = WordTimestamps.words(tokens: r.tokens, frameIndices: r.frameIndices,
@@ -1476,6 +1497,17 @@ func cmdTranscribe() async throws {
 /// (`{"audio": "/path.wav"}`), one response object per stdout line, model loaded once.
 /// stdout carries ONLY response JSON; every log line goes to stderr. A bad request or a
 /// failed file answers `{"error": ...}` on its line; the process never exits on a request.
+///
+/// **Progress is opt-in per request.** `{"audio": "/path.wav", "progress": true}` emits
+/// `{"progress": <0..1>}` lines on stdout as the work retires, before the one response
+/// line. Opt-in rather than always-on because "one response line per request" is the
+/// protocol every existing client is written against: a client that does not ask keeps
+/// reading exactly one line and is unaffected by this. A client that does ask reads until
+/// it sees a line without a `progress` key.
+///
+/// Coalesced to whole percents. A long file is thousands of retirements and a reader that
+/// has to parse every one of them to redraw the same number is being made to work for
+/// nothing.
 func cmdServe() async throws {
     let plan = parsePlan(option("plan"))
     let engine = try await ParakeetEngine(paths: artifactPaths(), plan: plan)
@@ -1496,8 +1528,26 @@ func cmdServe() async throws {
                 throw GraphError.message("expected {\"audio\": \"/path.wav\"}")
             }
             let t0 = Date()
-            let out = try await transcribeFile(engine: engine, path: audio,
-                                               label: "serve \(audio)", shape: shape)
+            let wantsProgress = (request["progress"] as? Bool) ?? false
+            var lastPercent = -1
+            let out = try await transcribeFile(
+                engine: engine, path: audio, label: "serve \(audio)", shape: shape,
+                onProgress: wantsProgress ? { done, total in
+                    guard total > 0 else { return }
+                    let fraction = Double(done) / Double(total)
+                    let percent = Int((fraction * 100).rounded(.down))
+                    guard percent != lastPercent else { return }
+                    lastPercent = percent
+                    // Written straight out rather than buffered: a progress line
+                    // that arrives when the work is finished has reported nothing.
+                    // Formatted rather than serialised. `JSONSerialization` prints a
+                    // Double at full precision — 0.05 comes out as
+                    // 0.050000000000000003 — and this object is one fixed key whose
+                    // value is already rounded to the percent it was coalesced to.
+                    // Two decimals is the whole grammar of the line.
+                    FileHandle.standardOutput.write(Data(
+                        String(format: "{\"progress\":%.2f}\n", Double(percent) / 100.0).utf8))
+                } : nil)
             FileHandle.standardError.write(Data(String(
                 format: "serve: %@ done in %.2f s (%.1f s audio)\n",
                 audio, -t0.timeIntervalSinceNow, out.audioSeconds).utf8))

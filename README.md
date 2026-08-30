@@ -154,6 +154,27 @@ For repeated transcription, `serve` avoids reloading the model. It reads one
 stdout in the `--json` shape. Stdout stays clean JSON-lines, all logging goes to stderr,
 and a failing request is answered inline rather than being fatal.
 
+Add `"progress": true` to a request and it emits `{"progress": <0..1>}` lines on stdout
+as the work retires, before the single response line:
+
+```json
+{"audio": "/path/chapter.wav", "progress": true}
+```
+```json
+{"progress": 0.12}
+{"progress": 0.13}
+...
+{"audio_seconds": 3612.4, "segments": [...]}
+```
+
+A long file is one call that can run for minutes with nothing on stdout, so without this
+a caller cannot tell slow from wedged. It is opt-in because "one response line per
+request" is the protocol existing clients are written against — a client that does not
+ask still reads exactly one line. A client that does ask reads until it sees a line with
+no `progress` key. Values are coalesced to whole percents, and cover both passes over the
+file (chunk decode, then word assembly and the blank-collapse retries below), so the
+number never reaches 1.0 with work still to do.
+
 ### How a file becomes chunks
 
 The encoder has one fixed input length, a bucket of 2885 mel frames, which is 28.85
